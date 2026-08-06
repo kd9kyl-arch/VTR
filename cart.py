@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 import struct
 import queue
+import glob
 
 from textual.app import App
 from textual.widgets import Header, Footer, ListView, ListItem, Static
@@ -115,11 +116,9 @@ def get_duration(fp):
 
 # ---------- TOUCHSCREEN SUPPORT (console PenMount) ----------
 # This implements a background thread that reads Linux input_event devices
-# and looks for a device named "PenMount". When a BTN_LEFT press is
-# observed, it enqueues the current ABS_X/ABS_Y to be handled in the
-# main Textual thread. We avoid generating synthetic mouse events; instead
-# the main thread maps the terminal coordinates to on-screen controls and
-# calls the existing handlers directly.
+# and locates a PenMount device by reading /sys/class/input/*/device/name.
+# When a BTN_LEFT press is observed, it enqueues the calibrated terminal
+# coordinates to be handled in the main Textual thread. No external libs used.
 
 # Linux input event constants
 _EV_KEY = 0x01
@@ -128,88 +127,88 @@ _BTN_LEFT = 0x110  # 272
 _ABS_X = 0x00
 _ABS_Y = 0x01
 
+# calibrated touchscreen extents (from user)
+TOUCH_MIN_X = 44
+TOUCH_MAX_X = 969
+TOUCH_MIN_Y = 51
+TOUCH_MAX_Y = 972
+
 # input_event struct: struct timeval (tv_sec long, tv_usec long), unsigned short type, unsigned short code, int value
 _INPUT_EVENT_FORMAT = 'llHHi'
 _INPUT_EVENT_SIZE = struct.calcsize(_INPUT_EVENT_FORMAT)
 
 _TOUCH_QUEUE = queue.Queue()
 
+# single-shot detection: if device is not present we will not enable touch support
+_thread_started = False
+
 
 def _find_penmount_event():
-    """Parse /proc/bus/input/devices to locate an event device whose Name contains PenMount.
-    Returns the /dev/input/eventX path or None."""
+    """Locate an event device whose name file under /sys/class/input contains 'PenMount'.
+    Returns the /dev/input/eventX path or None.
+    """
     try:
-        with open('/proc/bus/input/devices', 'r', encoding='utf-8', errors='ignore') as f:
-            data = f.read()
+        paths = glob.glob('/sys/class/input/*/device/name')
     except Exception:
         return None
 
-    # blocks separated by blank lines
-    blocks = data.split('\n\n')
-    for block in blocks:
-        lines = block.splitlines()
-        name = None
-        handlers = None
-        for line in lines:
-            line = line.strip()
-            if line.startswith('N:') and 'Name=' in line:
-                # N: Name="PenMount ..."
-                try:
-                    name = line.split('Name=')[1].strip().strip('"')
-                except Exception:
-                    name = line
-            if line.startswith('H:') and 'Handlers=' in line:
-                try:
-                    handlers = line.split('Handlers=')[1].strip()
-                except Exception:
-                    handlers = line
-        if name and 'PenMount' in name and handlers:
-            # find token like event2
-            for tok in handlers.split():
-                if tok.startswith('event'):
-                    path = os.path.join('/dev/input', tok)
-                    if os.path.exists(path):
-                        return path
+    for name_path in paths:
+        try:
+            with open(name_path, 'r', encoding='utf-8', errors='ignore') as f:
+                name = f.read().strip()
+        except Exception:
+            continue
+
+        if not name:
+            continue
+
+        if 'PenMount' in name:
+            # name_path: /sys/class/input/event2/device/name
+            event_dir = os.path.dirname(os.path.dirname(name_path))
+            event_basename = os.path.basename(event_dir)
+            dev_path = os.path.join('/dev/input', event_basename)
+            if os.path.exists(dev_path):
+                return dev_path
     return None
 
 
-def _touchscreen_thread_main():
-    """Thread that searches for PenMount device and reads events, pushing presses to _TOUCH_QUEUE."""
+def _touchscreen_thread_main(device_path):
+    """Thread that reads events from the given device_path and pushes calibrated
+    terminal coordinates on BTN_LEFT presses to _TOUCH_QUEUE. If the device cannot
+    be opened, the thread exits and touch support is disabled.
+    """
     abs_x = None
     abs_y = None
-    device_path = None
-    fd = None
 
-    while True:
+    try:
+        fd = open(device_path, 'rb')
+    except Exception as e:
         try:
-            if device_path is None:
-                device_path = _find_penmount_event()
-                if device_path is None:
-                    # no device yet; sleep and retry
-                    time.sleep(2)
-                    continue
+            print(f"[touch] failed to open {device_path}: {e}", flush=True)
+        except Exception:
+            pass
+        # disable further touch attempts
+        return
 
-            if fd is None:
-                try:
-                    fd = open(device_path, 'rb')
-                except Exception as e:
-                    print(f"[touch] failed to open {device_path}: {e}", flush=True)
-                    device_path = None
-                    time.sleep(2)
-                    continue
-
+    try:
+        while True:
             data = fd.read(_INPUT_EVENT_SIZE)
             if not data or len(data) < _INPUT_EVENT_SIZE:
-                # EOF or short read, device might have been disconnected
-                fd.close()
-                fd = None
-                device_path = None
-                abs_x = None
-                abs_y = None
-                time.sleep(1)
-                continue
+                # device disconnected or short read
+                try:
+                    fd.close()
+                except Exception:
+                    pass
+                try:
+                    print(f"[touch] device {device_path} disconnected", flush=True)
+                except Exception:
+                    pass
+                break
 
-            tv_sec, tv_usec, etype, code, value = struct.unpack(_INPUT_EVENT_FORMAT, data)
+            try:
+                tv_sec, tv_usec, etype, code, value = struct.unpack(_INPUT_EVENT_FORMAT, data)
+            except Exception:
+                continue
 
             if etype == _EV_ABS:
                 if code == _ABS_X:
@@ -219,37 +218,45 @@ def _touchscreen_thread_main():
             elif etype == _EV_KEY and code == _BTN_LEFT:
                 # value 1 == press, 0 == release
                 if value == 1:
-                    # enqueue the latest known coordinates
                     if abs_x is None or abs_y is None:
                         # ignore if position unknown
                         continue
-                    # clamp and normalize to 0-1023
-                    x = max(0, min(1023, int(abs_x)))
-                    y = max(0, min(1023, int(abs_y)))
+
+                    # clamp raw values
+                    rx = max(TOUCH_MIN_X, min(TOUCH_MAX_X, abs_x))
+                    ry = max(TOUCH_MIN_Y, min(TOUCH_MAX_Y, abs_y))
+
+                    # normalize to 0..1
                     try:
-                        _TOUCH_QUEUE.put_nowait((x, y))
+                        nx = (rx - TOUCH_MIN_X) / float(TOUCH_MAX_X - TOUCH_MIN_X)
+                        ny = (ry - TOUCH_MIN_Y) / float(TOUCH_MAX_Y - TOUCH_MIN_Y)
+                    except Exception:
+                        continue
+
+                    # flip both axes (180° rotation)
+                    nx = 1.0 - min(max(nx, 0.0), 1.0)
+                    ny = 1.0 - min(max(ny, 0.0), 1.0)
+
+                    # map to terminal size
+                    try:
+                        ts = os.get_terminal_size()
+                        cols = max(1, ts.columns)
+                        rows = max(1, ts.lines)
+                    except OSError:
+                        cols, rows = 80, 24
+
+                    tx = int(nx * (cols - 1))
+                    ty = int(ny * (rows - 1))
+
+                    try:
+                        _TOUCH_QUEUE.put_nowait((tx, ty))
                     except Exception:
                         pass
-        except Exception as e:
-            # Log and reset to attempt recovery
-            try:
-                print(f"[touch] error: {e}", flush=True)
-            except Exception:
-                pass
-            try:
-                if fd:
-                    fd.close()
-            except Exception:
-                pass
-            fd = None
-            device_path = None
-            abs_x = None
-            abs_y = None
-            time.sleep(1)
-
-
-# start the thread as a daemon so it won't block program exit
-_thread_started = False
+    finally:
+        try:
+            fd.close()
+        except Exception:
+            pass
 
 
 # ---------- APP ----------
@@ -287,6 +294,7 @@ class CartApp(App):
             Vertical(Static("[bold]FILES[/bold]"), self.file_list, id="files_box"),
             Vertical(Static("[bold]QUEUE[/bold]"), self.queue_list, id="queue_box"),
             Vertical(Static("[bold]PREVIEW[/bold]"), self.preview_panel, id="preview_box"),
+            # put the buttons in a box so it's better to use the touch screen
             Vertical(Static("[bold]CONTROLS[/bold]"), id="controls_box"),
         )
 
@@ -303,17 +311,25 @@ class CartApp(App):
 
         # Start touchscreen thread (only once). This thread will run on console
         # systems where a PenMount device is present. It will push touch events
-        # into _TOUCH_QUEUE which we poll from the main thread.
+        # into _TOUCH_QUEUE which we poll from the main thread. If no PenMount
+        # device is present, we will not enable touch support.
         global _thread_started
         if not _thread_started:
-            t = threading.Thread(target=_touchscreen_thread_main, daemon=True)
-            t.start()
-            _thread_started = True
+            dev = _find_penmount_event()
+            if dev is None:
+                try:
+                    print("[touch] PenMount device not found; console touch disabled", flush=True)
+                except Exception:
+                    pass
+            else:
+                t = threading.Thread(target=_touchscreen_thread_main, args=(dev,), daemon=True)
+                t.start()
+                _thread_started = True
 
         # Poll the touch queue at a short interval so handling runs on the main thread
         self.set_interval(0.05, self._process_touch_queue)
 
-        # build controls (top-down)
+        # build controls (top-down) inside controls_box
         labels = ["▲ UP", "▼ DOWN", "PLAY", "ENTER", "BREAK", "CLEAR", "SLATE"]
         box = self.query_one("#controls_box")
         for lbl in labels:
@@ -526,6 +542,10 @@ class CartApp(App):
     def _process_touch_queue(self):
         """Called in the main thread via set_interval. Pops touch events and
         maps them to UI actions by calling existing handlers directly.
+        
+        Touch events are enqueued as terminal coordinates (col, row) by the
+        background thread, so we map those coordinates directly to columns
+        and rows of the current terminal size.
         """
         while not _TOUCH_QUEUE.empty():
             try:
@@ -533,17 +553,23 @@ class CartApp(App):
             except queue.Empty:
                 break
 
-            # Map touchscreen 0-1023 to terminal coordinates
+            # x,y are terminal coordinates (0..cols-1, 0..rows-1)
             try:
                 ts_cols, ts_rows = os.get_terminal_size()
                 cols = ts_cols
                 rows = ts_rows
             except OSError:
-                # fallback
                 cols, rows = 80, 24
 
+            # clamp coordinates just in case
+            try:
+                cx = max(0, min(cols - 1, int(x)))
+                cy = max(0, min(rows - 1, int(y)))
+            except Exception:
+                continue
+
             # Determine column (now four columns for FILES / QUEUE / PREVIEW / CONTROLS horizontally)
-            col_index = int((x / 1023.0) * 4)
+            col_index = int((cx / float(cols)) * 4)
             if col_index < 0:
                 col_index = 0
             if col_index > 3:
@@ -551,7 +577,7 @@ class CartApp(App):
 
             # Determine whether touch is in the top area (lists/previews) or status area.
             # We'll consider the top ~60% of the terminal as the content area and the bottom as status.
-            is_status = (y / 1023.0) > 0.6
+            is_status = (cy / float(rows)) > 0.6
 
             # Map y to an index within list items if appropriate
             if not is_status and col_index == 0:
@@ -559,7 +585,7 @@ class CartApp(App):
                 items = [c for c in self.file_list.children]
                 if not items:
                     continue
-                idx = int((y / 1023.0) * len(items))
+                idx = int((cy / float(rows)) * len(items))
                 if idx < 0:
                     idx = 0
                 if idx >= len(items):
@@ -586,12 +612,15 @@ class CartApp(App):
                 controls = self.controls_buttons
                 if not controls:
                     continue
-                idx = int((y / 1023.0) * len(controls))
+                idx = int((cy / float(rows)) * len(controls))
                 if idx < 0:
                     idx = 0
                 if idx >= len(controls):
                     idx = len(controls) - 1
-                label = controls[idx].renderable if hasattr(controls[idx], 'renderable') else None
+                try:
+                    label = controls[idx].renderable if hasattr(controls[idx], 'renderable') else None
+                except Exception:
+                    label = None
                 try:
                     text = str(controls[idx]._text) if hasattr(controls[idx], '_text') else str(label)
                 except Exception:
