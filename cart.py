@@ -3,6 +3,8 @@ import subprocess
 import time
 import threading
 from datetime import datetime
+import struct
+import queue
 
 from textual.app import App
 from textual.widgets import Header, Footer, ListView, ListItem, Static
@@ -111,6 +113,145 @@ def get_duration(fp):
         return 0
 
 
+# ---------- TOUCHSCREEN SUPPORT (console PenMount) ----------
+# This implements a background thread that reads Linux input_event devices
+# and looks for a device named "PenMount". When a BTN_LEFT press is
+# observed, it enqueues the current ABS_X/ABS_Y to be handled in the
+# main Textual thread. We avoid generating synthetic mouse events; instead
+# the main thread maps the terminal coordinates to on-screen controls and
+# calls the existing handlers directly.
+
+# Linux input event constants
+_EV_KEY = 0x01
+_EV_ABS = 0x03
+_BTN_LEFT = 0x110  # 272
+_ABS_X = 0x00
+_ABS_Y = 0x01
+
+# input_event struct: struct timeval (tv_sec long, tv_usec long), unsigned short type, unsigned short code, int value
+_INPUT_EVENT_FORMAT = 'llHHi'
+_INPUT_EVENT_SIZE = struct.calcsize(_INPUT_EVENT_FORMAT)
+
+_TOUCH_QUEUE = queue.Queue()
+
+
+def _find_penmount_event():
+    """Parse /proc/bus/input/devices to locate an event device whose Name contains PenMount.
+    Returns the /dev/input/eventX path or None."""
+    try:
+        with open('/proc/bus/input/devices', 'r', encoding='utf-8', errors='ignore') as f:
+            data = f.read()
+    except Exception:
+        return None
+
+    # blocks separated by blank lines
+    blocks = data.split('\n\n')
+    for block in blocks:
+        lines = block.splitlines()
+        name = None
+        handlers = None
+        for line in lines:
+            line = line.strip()
+            if line.startswith('N:') and 'Name=' in line:
+                # N: Name="PenMount ..."
+                try:
+                    name = line.split('Name=')[1].strip().strip('"')
+                except Exception:
+                    name = line
+            if line.startswith('H:') and 'Handlers=' in line:
+                try:
+                    handlers = line.split('Handlers=')[1].strip()
+                except Exception:
+                    handlers = line
+        if name and 'PenMount' in name and handlers:
+            # find token like event2
+            for tok in handlers.split():
+                if tok.startswith('event'):
+                    path = os.path.join('/dev/input', tok)
+                    if os.path.exists(path):
+                        return path
+    return None
+
+
+def _touchscreen_thread_main():
+    """Thread that searches for PenMount device and reads events, pushing presses to _TOUCH_QUEUE."""
+    abs_x = None
+    abs_y = None
+    device_path = None
+    fd = None
+
+    while True:
+        try:
+            if device_path is None:
+                device_path = _find_penmount_event()
+                if device_path is None:
+                    # no device yet; sleep and retry
+                    time.sleep(2)
+                    continue
+
+            if fd is None:
+                try:
+                    fd = open(device_path, 'rb')
+                except Exception as e:
+                    print(f"[touch] failed to open {device_path}: {e}", flush=True)
+                    device_path = None
+                    time.sleep(2)
+                    continue
+
+            data = fd.read(_INPUT_EVENT_SIZE)
+            if not data or len(data) < _INPUT_EVENT_SIZE:
+                # EOF or short read, device might have been disconnected
+                fd.close()
+                fd = None
+                device_path = None
+                abs_x = None
+                abs_y = None
+                time.sleep(1)
+                continue
+
+            tv_sec, tv_usec, etype, code, value = struct.unpack(_INPUT_EVENT_FORMAT, data)
+
+            if etype == _EV_ABS:
+                if code == _ABS_X:
+                    abs_x = int(value)
+                elif code == _ABS_Y:
+                    abs_y = int(value)
+            elif etype == _EV_KEY and code == _BTN_LEFT:
+                # value 1 == press, 0 == release
+                if value == 1:
+                    # enqueue the latest known coordinates
+                    if abs_x is None or abs_y is None:
+                        # ignore if position unknown
+                        continue
+                    # clamp and normalize to 0-1023
+                    x = max(0, min(1023, int(abs_x)))
+                    y = max(0, min(1023, int(abs_y)))
+                    try:
+                        _TOUCH_QUEUE.put_nowait((x, y))
+                    except Exception:
+                        pass
+        except Exception as e:
+            # Log and reset to attempt recovery
+            try:
+                print(f"[touch] error: {e}", flush=True)
+            except Exception:
+                pass
+            try:
+                if fd:
+                    fd.close()
+            except Exception:
+                pass
+            fd = None
+            device_path = None
+            abs_x = None
+            abs_y = None
+            time.sleep(1)
+
+
+# start the thread as a daemon so it won't block program exit
+_thread_started = False
+
+
 # ---------- APP ----------
 class CartApp(App):
 
@@ -163,6 +304,18 @@ class CartApp(App):
         self.set_interval(1, self.update_timer)
         self.set_interval(1, self.update_clock)
         self.set_interval(0.5, self.check_remote_trigger)
+
+        # Start touchscreen thread (only once). This thread will run on console
+        # systems where a PenMount device is present. It will push touch events
+        # into _TOUCH_QUEUE which we poll from the main thread.
+        global _thread_started
+        if not _thread_started:
+            t = threading.Thread(target=_touchscreen_thread_main, daemon=True)
+            t.start()
+            _thread_started = True
+
+        # Poll the touch queue at a short interval so handling runs on the main thread
+        self.set_interval(0.05, self._process_touch_queue)
 
     def check_remote_trigger(self):
 
@@ -274,6 +427,73 @@ class CartApp(App):
         t = now.strftime("%H:%M:%S") if self.colon_on else now.strftime("%H %M %S")
         self.colon_on = not self.colon_on
         self.clock_display.update(f"[bold cyan]{render_big(t)}[/bold cyan]")
+
+    def _process_touch_queue(self):
+        """Called in the main thread via set_interval. Pops touch events and
+        maps them to UI actions by calling existing handlers directly.
+        """
+        while not _TOUCH_QUEUE.empty():
+            try:
+                x, y = _TOUCH_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+
+            # Map touchscreen 0-1023 to terminal coordinates
+            try:
+                ts_cols, ts_rows = os.get_terminal_size()
+                cols = ts_cols
+                rows = ts_rows
+            except OSError:
+                # fallback
+                cols, rows = 80, 24
+
+            # Determine column (three columns for FILES / QUEUE / PREVIEW horizontally)
+            col_index = int((x / 1023.0) * 3)
+            if col_index < 0:
+                col_index = 0
+            if col_index > 2:
+                col_index = 2
+
+            # Determine whether touch is in the top area (lists/previews) or status area.
+            # We'll consider the top ~60% of the terminal as the content area and the bottom as status.
+            is_status = (y / 1023.0) > 0.6
+
+            # Map y to an index within list items if appropriate
+            if not is_status and col_index == 0:
+                # FILES list touched
+                items = [c for c in self.file_list.children]
+                if not items:
+                    continue
+                idx = int((y / 1023.0) * len(items))
+                if idx < 0:
+                    idx = 0
+                if idx >= len(items):
+                    idx = len(items) - 1
+                item = items[idx]
+                # mimic what on_list_view_selected does
+                try:
+                    self.queue.append(item.filename)
+                    self.update_queue()
+                    if len(self.queue) == 1:
+                        self.arm_next()
+                except Exception as e:
+                    print(f"[touch] error handling file touch: {e}", flush=True)
+
+            elif not is_status and col_index == 2:
+                # PREVIEW touched -> trigger play
+                try:
+                    self.trigger_play()
+                except Exception as e:
+                    print(f"[touch] error handling preview touch: {e}", flush=True)
+
+            else:
+                # For queue column or status area, treat as a play command
+                try:
+                    self.trigger_play()
+                except Exception as e:
+                    print(f"[touch] error handling generic touch: {e}", flush=True)
+
+    # Keep main entrypoint unchanged
 
 
 if __name__ == "__main__":
