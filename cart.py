@@ -259,10 +259,10 @@ class CartApp(App):
     #files_box { border: round cyan; padding: 1; }
     #queue_box { border: round yellow; padding: 1; }
     #preview_box { border: round magenta; padding: 1; }
-    #status_box { border: round green; padding: 1; }
+    #controls_box { border: round blue; padding: 1; }
+    #status_bar { border: round green; padding: 1; }
 
-    #timer { content-align: center middle; height: 7; }
-    #clock { content-align: center middle; height: 10; }
+    #controls_box > .control { width: 100%; }
     """
 
     queue = reactive([])
@@ -275,10 +275,11 @@ class CartApp(App):
         self.preview_panel = Static("Waiting...")
 
         self.now_playing = Static("Idle")
-        self.timer_display = Static("", id="timer")
-        self.clock_display = Static("", id="clock")
+        # replaced big timer/clock with a single status bar
+        self.status_bar = Static("")
 
-        self.colon_on = True
+        # controls
+        self.controls_buttons = []
 
         yield Header()
 
@@ -286,23 +287,18 @@ class CartApp(App):
             Vertical(Static("[bold]FILES[/bold]"), self.file_list, id="files_box"),
             Vertical(Static("[bold]QUEUE[/bold]"), self.queue_list, id="queue_box"),
             Vertical(Static("[bold]PREVIEW[/bold]"), self.preview_panel, id="preview_box"),
+            Vertical(Static("[bold]CONTROLS[/bold]"), id="controls_box"),
         )
 
-        yield Vertical(
-            Static("[bold]STATUS[/bold]"),
-            self.now_playing,
-            self.timer_display,
-            self.clock_display,
-            id="status_box"
-        )
+        yield self.status_bar
 
         yield Footer()
 
     def on_mount(self):
         player.idle(SLATE_FILE)
         self.set_interval(30, self.load_files)
-        self.set_interval(1, self.update_timer)
-        self.set_interval(1, self.update_clock)
+        # status updates once per second
+        self.set_interval(1, self.update_status_bar)
         self.set_interval(0.5, self.check_remote_trigger)
 
         # Start touchscreen thread (only once). This thread will run on console
@@ -317,6 +313,18 @@ class CartApp(App):
         # Poll the touch queue at a short interval so handling runs on the main thread
         self.set_interval(0.05, self._process_touch_queue)
 
+        # build controls (top-down)
+        labels = ["▲ UP", "▼ DOWN", "PLAY", "ENTER", "BREAK", "CLEAR", "SLATE"]
+        box = self.query_one("#controls_box")
+        for lbl in labels:
+            w = Static(lbl, classes="control")
+            box.mount(w)
+            self.controls_buttons.append(w)
+
+        # track file selection for ENTER/UP/DOWN
+        self.selected_index = 0
+        self.load_files()
+
     def check_remote_trigger(self):
 
         if os.path.exists("/tmp/playnow"):
@@ -327,14 +335,52 @@ class CartApp(App):
 
 
     def load_files(self):
+        # preserve selected index across reloads
+        try:
+            prev = self.selected_index
+        except Exception:
+            prev = 0
+
+        files = [f for f in sorted(os.listdir(MEDIA_DIR)) if f.endswith(".mov")]
         self.file_list.clear()
-        for f in sorted(os.listdir(MEDIA_DIR)):
-            if f.endswith(".mov"):
-                item = ListItem(Static(f))
-                item.filename = f
-                self.file_list.append(item)
+        for i, f in enumerate(files):
+            item = ListItem(Static(f))
+            item.filename = f
+            item._file_index = i
+            self.file_list.append(item)
+
+        if files:
+            # clamp
+            self.selected_index = max(0, min(prev, len(files) - 1))
+        else:
+            self.selected_index = 0
+        self._refresh_file_selection()
+
+    def _refresh_file_selection(self):
+        # visually mark the selected file
+        items = [c for c in self.file_list.children]
+        for i, item in enumerate(items):
+            try:
+                widget = item.children[0]
+                if i == self.selected_index:
+                    widget.update(f"[reverse]{item.filename}[/reverse]")
+                else:
+                    widget.update(item.filename)
+            except Exception:
+                pass
 
     def on_list_view_selected(self, event):
+        # keep selected_index in sync if user selects via keyboard/mouse
+        try:
+            # event.item may have ._file_index
+            idx = getattr(event.item, "_file_index", None)
+            if idx is not None:
+                self.selected_index = idx
+                self._refresh_file_selection()
+        except Exception:
+            pass
+
+        # ENTER behavior previously queued when selecting; keep same behavior
         self.queue.append(event.item.filename)
         self.update_queue()
         if len(self.queue) == 1:
@@ -414,19 +460,68 @@ class CartApp(App):
         self.update_queue()
         player.idle(SLATE_FILE)
 
-    def update_timer(self):
-        if self.current_duration <= 0:
+    # New control actions
+    def control_up(self):
+        items = [c for c in self.file_list.children]
+        if not items:
             return
+        self.selected_index = max(0, self.selected_index - 1)
+        self._refresh_file_selection()
 
-        remaining = max(0, self.current_duration - (time.time() - self.start_time))
-        t = f"{int(remaining//60):02}:{int(remaining%60):02}"
-        self.timer_display.update(render_big(t))
+    def control_down(self):
+        items = [c for c in self.file_list.children]
+        if not items:
+            return
+        self.selected_index = min(len(items) - 1, self.selected_index + 1)
+        self._refresh_file_selection()
 
-    def update_clock(self):
-        now = datetime.now().astimezone()
-        t = now.strftime("%H:%M:%S") if self.colon_on else now.strftime("%H %M %S")
-        self.colon_on = not self.colon_on
-        self.clock_display.update(f"[bold cyan]{render_big(t)}[/bold cyan]")
+    def control_enter(self):
+        items = [c for c in self.file_list.children]
+        if not items:
+            return
+        f = items[self.selected_index].filename
+        self.queue.append(f)
+        self.update_queue()
+        if len(self.queue) == 1:
+            self.arm_next()
+
+    def control_play(self):
+        self.trigger_play()
+
+    def control_break(self):
+        self.queue.append("BREAK")
+        self.update_queue()
+
+    def control_clear(self):
+        self.queue.clear()
+        self.update_queue()
+        player.idle(SLATE_FILE)
+
+    def control_slate(self):
+        player.idle(SLATE_FILE)
+
+    def update_status_bar(self):
+        # NOW, REMAIN, CLOCK on one line
+        now_text = "Idle"
+        try:
+            np = self.now_playing.renderable
+            # if now_playing contains a simple string we can use text
+            now_text = str(np)
+        except Exception:
+            try:
+                now_text = self.now_playing._text
+            except Exception:
+                now_text = "Idle"
+
+        if self.current_duration <= 0:
+            remain = "00:00"
+        else:
+            remaining = max(0, self.current_duration - (time.time() - self.start_time))
+            remain = f"{int(remaining//60):02}:{int(remaining%60):02}"
+
+        clock = datetime.now().strftime("%H:%M:%S")
+
+        self.status_bar.update(f"NOW: {now_text}    REMAIN: {remain}    CLOCK: {clock}")
 
     def _process_touch_queue(self):
         """Called in the main thread via set_interval. Pops touch events and
@@ -447,12 +542,12 @@ class CartApp(App):
                 # fallback
                 cols, rows = 80, 24
 
-            # Determine column (three columns for FILES / QUEUE / PREVIEW horizontally)
-            col_index = int((x / 1023.0) * 3)
+            # Determine column (now four columns for FILES / QUEUE / PREVIEW / CONTROLS horizontally)
+            col_index = int((x / 1023.0) * 4)
             if col_index < 0:
                 col_index = 0
-            if col_index > 2:
-                col_index = 2
+            if col_index > 3:
+                col_index = 3
 
             # Determine whether touch is in the top area (lists/previews) or status area.
             # We'll consider the top ~60% of the terminal as the content area and the bottom as status.
@@ -485,6 +580,37 @@ class CartApp(App):
                     self.trigger_play()
                 except Exception as e:
                     print(f"[touch] error handling preview touch: {e}", flush=True)
+
+            elif not is_status and col_index == 3:
+                # CONTROLS touched -> map to buttons
+                controls = self.controls_buttons
+                if not controls:
+                    continue
+                idx = int((y / 1023.0) * len(controls))
+                if idx < 0:
+                    idx = 0
+                if idx >= len(controls):
+                    idx = len(controls) - 1
+                label = controls[idx].renderable if hasattr(controls[idx], 'renderable') else None
+                try:
+                    text = str(controls[idx]._text) if hasattr(controls[idx], '_text') else str(label)
+                except Exception:
+                    text = ""
+                # dispatch
+                if text.startswith("▲") or text.strip().endswith("UP"):
+                    self.control_up()
+                elif text.startswith("▼") or text.strip().endswith("DOWN"):
+                    self.control_down()
+                elif text.strip() == "PLAY":
+                    self.control_play()
+                elif text.strip() == "ENTER":
+                    self.control_enter()
+                elif text.strip() == "BREAK":
+                    self.control_break()
+                elif text.strip() == "CLEAR":
+                    self.control_clear()
+                elif text.strip() == "SLATE":
+                    self.control_slate()
 
             else:
                 # For queue column or status area, treat as a play command
