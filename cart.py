@@ -269,7 +269,22 @@ class CartApp(App):
     #controls_box { border: round blue; padding: 1; }
     #status_bar { border: round green; padding: 1; }
 
-    #controls_box > .control { width: 100%; }
+    /* Make touchscreen controls large and easy to tap */
+    #controls_box > .control {
+        width: 100%;
+        height: 3;
+        min-height: 3;
+        padding: 1 2;
+        content-align: center middle;
+        text-align: center;
+        border: heavy round blue;
+    }
+
+    #controls_box > .control:hover {
+        background: $accent;
+        color: black;
+    }
+
     """
 
     queue = reactive([])
