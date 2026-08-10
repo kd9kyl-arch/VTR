@@ -348,7 +348,18 @@ class CartApp(App):
         labels = ["▲ UP", "▼ DOWN", "PLAY", "ENTER", "BREAK", "CLEAR", "SLATE"]
         box = self.query_one("#controls_box")
         for lbl in labels:
+            # create a Static widget and store the label string on the widget so
+            # touch handling can reliably read it later. Also call update() to
+            # ensure the renderable content is set.
             w = Static(lbl, classes="control")
+            try:
+                # ensure the visible text is set
+                w.update(lbl)
+            except Exception:
+                pass
+            # store label in a consistent attribute used later by touch handler
+            w._text = lbl
+            w.label = lbl
             box.mount(w)
             self.controls_buttons.append(w)
 
@@ -633,11 +644,11 @@ class CartApp(App):
                 if idx >= len(controls):
                     idx = len(controls) - 1
                 try:
-                    label = controls[idx].renderable if hasattr(controls[idx], 'renderable') else None
-                except Exception:
-                    label = None
-                try:
-                    text = str(controls[idx]._text) if hasattr(controls[idx], '_text') else str(label)
+                    # Prefer our stored label attributes, fall back to renderable
+                    text = getattr(controls[idx], "_text", None) or getattr(controls[idx], "label", None)
+                    if not text:
+                        rend = getattr(controls[idx], "renderable", "")
+                        text = str(rend)
                 except Exception:
                     text = ""
                 # dispatch
