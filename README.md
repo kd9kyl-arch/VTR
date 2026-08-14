@@ -6,6 +6,7 @@ The VTR holds the python program - a remote computer / touch screen IPs to the V
 
 Mock display below
 
+```
 ┌──────────┬──────────┬──────────┬────────────┐
 │  FILES   │  QUEUE   │ PREVIEW  │ ▲ UP       │
 │          │          │          ├────────────┤
@@ -24,3 +25,4 @@ Mock display below
 │                                │    PLAY    │
 │                                │            │
 └────────────────────────────────┴────────────┘
+```
