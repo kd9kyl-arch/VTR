@@ -8,7 +8,7 @@ import queue
 import glob
 
 from textual.app import App
-from textual.widgets import Header, Footer, ListView, ListItem, Static
+from textual.widgets import Header, Footer, ListView, ListItem, Static, Button
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 
@@ -263,26 +263,43 @@ def _touchscreen_thread_main(device_path):
 class CartApp(App):
 
     CSS = """
-    #files_box { border: round cyan; padding: 1; }
-    #queue_box { border: round yellow; padding: 1; }
-    #preview_box { border: round magenta; padding: 1; }
-    #controls_box { border: round blue; padding: 1; }
-    #status_bar { border: round green; padding: 1; }
+    #main_area { height: 1fr; }
+    #left_area { width: 3fr; height: 1fr; }
+    #top_boxes { height: 1fr; }
+    #files_box { width: 1fr; border: round cyan; padding: 1; }
+    #queue_box { width: 1fr; border: round yellow; padding: 1; }
+    #preview_box { width: 1fr; border: round magenta; padding: 1; }
+    #controls_box { width: 1fr; height: 1fr; border: round blue; padding: 1; }
+    #status_bar { border: round green; padding: 1; height: 3; min-height: 3; }
+    #play_indicator { border: heavy red; height: 7; min-height: 7; content-align: center middle; text-align: center; text-style: bold; }
 
     /* Make touchscreen controls large and easy to tap */
-    #controls_box > .control {
+    #controls_box > Button {
         width: 100%;
-        height: 3;
+        height: 1fr;
         min-height: 3;
-        padding: 1 2;
         content-align: center middle;
         text-align: center;
-        border: heavy round blue;
+        margin: 0;
+        border: heavy cyan;
+        text-style: bold;
     }
 
-    #controls_box > .control:hover {
-        background: $accent;
-        color: black;
+    #btn_play {
+        height: 2fr;
+        min-height: 6;
+        border: heavy green;
+        text-style: bold;
+    }
+
+    #controls_box > Button:focus {
+        border: heavy yellow;
+        text-style: bold reverse;
+    }
+
+    #controls_box > Button:hover {
+        border: heavy magenta;
+        text-style: bold;
     }
 
     """
@@ -290,6 +307,9 @@ class CartApp(App):
     queue = reactive([])
     current_duration = reactive(0.0)
     start_time = reactive(0.0)
+    is_playing = reactive(False)
+    play_anim_frame = reactive(0)
+    current_file = reactive("")
 
     def compose(self):
         self.file_list = ListView()
@@ -299,21 +319,40 @@ class CartApp(App):
         self.now_playing = Static("Idle")
         # replaced big timer/clock with a single status bar
         self.status_bar = Static("")
+        self.play_indicator = Static("■ VTR STOPPED", id="play_indicator")
 
-        # controls
-        self.controls_buttons = []
+        # Real Textual Button widgets. These display their labels and generate
+        # Button.Pressed events for mouse/touch/keyboard activation.
+        self.controls_buttons = [
+            Button("▲ UP", id="btn_up"),
+            Button("▼ DOWN", id="btn_down"),
+            Button("ENTER", id="btn_enter"),
+            Button("BREAK", id="btn_break"),
+            Button("STOP", id="btn_stop"),
+            Button("CLEAR", id="btn_clear"),
+            Button("SLATE", id="btn_slate"),
+            Button("PLAY", id="btn_play"),
+        ]
 
         yield Header()
 
+        # Left side contains FILES / QUEUE / PREVIEW plus the VTR status area.
+        # The CONTROLS column is separate so it can use the full screen height.
         yield Horizontal(
-            Vertical(Static("[bold]FILES[/bold]"), self.file_list, id="files_box"),
-            Vertical(Static("[bold]QUEUE[/bold]"), self.queue_list, id="queue_box"),
-            Vertical(Static("[bold]PREVIEW[/bold]"), self.preview_panel, id="preview_box"),
-            # put the buttons in a box so it's better to use the touch screen
-            Vertical(Static("[bold]CONTROLS[/bold]"), id="controls_box"),
+            Vertical(
+                Horizontal(
+                    Vertical(Static("[bold]FILES[/bold]"), self.file_list, id="files_box"),
+                    Vertical(Static("[bold]QUEUE[/bold]"), self.queue_list, id="queue_box"),
+                    Vertical(Static("[bold]PREVIEW[/bold]"), self.preview_panel, id="preview_box"),
+                    id="top_boxes",
+                ),
+                self.play_indicator,
+                self.status_bar,
+                id="left_area",
+            ),
+            Vertical(Static("[bold]CONTROLS[/bold]"), *self.controls_buttons, id="controls_box"),
+            id="main_area",
         )
-
-        yield self.status_bar
 
         yield Footer()
 
@@ -321,7 +360,8 @@ class CartApp(App):
         player.idle(SLATE_FILE)
         self.set_interval(30, self.load_files)
         # status updates once per second
-        self.set_interval(1, self.update_status_bar)
+        self.set_interval(0.25, self.update_status_bar)
+        self.set_interval(0.25, self.update_play_indicator)
         self.set_interval(0.5, self.check_remote_trigger)
 
         # Start touchscreen thread (only once). This thread will run on console
@@ -343,25 +383,6 @@ class CartApp(App):
 
         # Poll the touch queue at a short interval so handling runs on the main thread
         self.set_interval(0.05, self._process_touch_queue)
-
-        # build controls (top-down) inside controls_box
-        labels = ["▲ UP", "▼ DOWN", "PLAY", "ENTER", "BREAK", "CLEAR", "SLATE"]
-        box = self.query_one("#controls_box")
-        for lbl in labels:
-            # create a Static widget and store the label string on the widget so
-            # touch handling can reliably read it later. Also call update() to
-            # ensure the renderable content is set.
-            w = Static(lbl, classes="control")
-            try:
-                # ensure the visible text is set
-                w.update(lbl)
-            except Exception:
-                pass
-            # store label in a consistent attribute used later by touch handler
-            w._text = lbl
-            w.label = lbl
-            box.mount(w)
-            self.controls_buttons.append(w)
 
         # track file selection for ENTER/UP/DOWN
         self.selected_index = 0
@@ -452,6 +473,10 @@ class CartApp(App):
 
     # 🔥 5 SECOND HOLD
     def play_next_auto(self):
+        self.is_playing = False
+        self.current_duration = 0.0
+        self.start_time = 0.0
+        self.current_file = ""
         if not self.queue or self.queue[0] == "BREAK":
 
             def delayed_idle():
@@ -478,6 +503,8 @@ class CartApp(App):
         fp = os.path.join(MEDIA_DIR, f)
 
         self.now_playing.update(f"Now Playing: {f}")
+        self.current_file = f
+        self.is_playing = True
         self.start_time = time.time()
         self.current_duration = get_duration(fp)
 
@@ -501,6 +528,23 @@ class CartApp(App):
         self.queue.clear()
         self.update_queue()
         player.idle(SLATE_FILE)
+
+    def on_button_pressed(self, event: Button.Pressed):
+        """Dispatch the visible touchscreen control buttons."""
+        button_id = event.button.id
+        actions = {
+            "btn_up": self.control_up,
+            "btn_down": self.control_down,
+            "btn_play": self.control_play,
+            "btn_enter": self.control_enter,
+            "btn_break": self.control_break,
+            "btn_stop": self.control_stop,
+            "btn_clear": self.control_clear,
+            "btn_slate": self.control_slate,
+        }
+        action = actions.get(button_id)
+        if action:
+            action()
 
     # New control actions
     def control_up(self):
@@ -534,36 +578,89 @@ class CartApp(App):
         self.queue.append("BREAK")
         self.update_queue()
 
+    def control_stop(self):
+        """Stop current playback immediately and return to slate."""
+        if player.process:
+            try:
+                player.process.kill()
+                player.process = None
+            except Exception:
+                pass
+        self.current_duration = 0.0
+        self.start_time = 0.0
+        self.now_playing.update("Stopped")
+        self.current_file = ""
+        self.is_playing = False
+        player.idle(SLATE_FILE)
+        self.arm_next()
+
     def control_clear(self):
+        self.is_playing = False
+        self.current_file = ""
+        self.current_duration = 0.0
+        self.start_time = 0.0
         self.queue.clear()
         self.update_queue()
         player.idle(SLATE_FILE)
 
     def control_slate(self):
+        self.is_playing = False
+        self.current_file = ""
+        self.current_duration = 0.0
+        self.start_time = 0.0
         player.idle(SLATE_FILE)
 
-    def update_status_bar(self):
-        # NOW, REMAIN, CLOCK on one line
-        now_text = "Idle"
-        try:
-            np = self.now_playing.renderable
-            # if now_playing contains a simple string we can use text
-            now_text = str(np)
-        except Exception:
-            try:
-                now_text = self.now_playing._text
-            except Exception:
-                now_text = "Idle"
+    def update_play_indicator(self):
+        """Large VTR transport display with animation, countdown, progress and NEXT."""
+        next_item = self.queue[0] if self.queue else "-- NONE --"
+        if self.is_playing:
+            elapsed = max(0.0, time.time() - self.start_time)
+            remaining = max(0.0, self.current_duration - elapsed) if self.current_duration > 0 else 0.0
+            remain = f"{int(remaining//60):02}:{int(remaining%60):02}"
+            progress = min(1.0, elapsed / self.current_duration) if self.current_duration > 0 else 0.0
+            width = 30
+            filled = max(0, min(width, int(progress * width)))
+            bar = "█" * filled + "░" * (width - filled)
 
-        if self.current_duration <= 0:
-            remain = "00:00"
+            frames = ["●○○○", "○●○○", "○○●○", "○○○●"]
+            self.play_anim_frame = (self.play_anim_frame + 1) % len(frames)
+            anim = frames[self.play_anim_frame]
+
+            if 0 < remaining <= 10:
+                title = "[bold red reverse]⚠ ENDING ⚠[/bold red reverse]"
+                timer = f"[bold red]{remain}[/bold red]"
+            elif 0 < remaining <= 30:
+                title = "[bold yellow]▶ VTR PLAYING[/bold yellow]"
+                timer = f"[bold yellow]{remain}[/bold yellow]"
+            else:
+                title = "[bold green]▶ VTR PLAYING[/bold green]"
+                timer = f"[bold green]{remain}[/bold green]"
+
+            self.play_indicator.update(
+                f"{title}   {anim}    REMAIN {timer}\n"
+                f"[{bar}]\n"
+                f"NOW: {self.current_file}\n"
+                f"NEXT: {next_item}"
+            )
         else:
+            self.play_anim_frame = 0
+            state = "BREAK - WAITING" if self.queue and self.queue[0] == "BREAK" else "VTR STOPPED"
+            self.play_indicator.update(
+                f"[bold red]■ {state}[/bold red]\n"
+                f"NOW: --\n"
+                f"NEXT: {next_item}"
+            )
+
+    def update_status_bar(self):
+        """Compact bottom status line; large countdown lives in play_indicator."""
+        if self.current_duration > 0 and self.is_playing:
             remaining = max(0, self.current_duration - (time.time() - self.start_time))
             remain = f"{int(remaining//60):02}:{int(remaining%60):02}"
-
+        else:
+            remain = "00:00"
         clock = datetime.now().strftime("%H:%M:%S")
-
-        self.status_bar.update(f"NOW: {now_text}    REMAIN: {remain}    CLOCK: {clock}")
+        state = "PLAY" if self.is_playing else "STOP"
+        self.status_bar.update(f"VTR: {state}    REMAIN: {remain}    CLOCK: {clock}")
 
     def _process_touch_queue(self):
         """Called in the main thread via set_interval. Pops touch events and
@@ -643,29 +740,14 @@ class CartApp(App):
                     idx = 0
                 if idx >= len(controls):
                     idx = len(controls) - 1
-                try:
-                    # Prefer our stored label attributes, fall back to renderable
-                    text = getattr(controls[idx], "_text", None) or getattr(controls[idx], "label", None)
-                    if not text:
-                        rend = getattr(controls[idx], "renderable", "")
-                        text = str(rend)
-                except Exception:
-                    text = ""
-                # dispatch
-                if text.startswith("▲") or text.strip().endswith("UP"):
-                    self.control_up()
-                elif text.startswith("▼") or text.strip().endswith("DOWN"):
-                    self.control_down()
-                elif text.strip() == "PLAY":
-                    self.control_play()
-                elif text.strip() == "ENTER":
-                    self.control_enter()
-                elif text.strip() == "BREAK":
-                    self.control_break()
-                elif text.strip() == "CLEAR":
-                    self.control_clear()
-                elif text.strip() == "SLATE":
-                    self.control_slate()
+                # Dispatch by fixed top-to-bottom button position. This avoids
+                # depending on Textual's internal label/renderable representation.
+                actions = [
+                    self.control_up, self.control_down, self.control_enter,
+                    self.control_break, self.control_stop, self.control_clear,
+                    self.control_slate, self.control_play,
+                ]
+                actions[idx]()
 
             else:
                 # For queue column or status area, treat as a play command
